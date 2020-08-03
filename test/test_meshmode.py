@@ -28,6 +28,8 @@ import numpy as np
 import numpy.linalg as la
 import pyopencl as cl
 
+from pytools.obj_array import make_obj_array
+
 from pyopencl.tools import (  # noqa
         pytest_generate_tests_for_pyopencl
         as pytest_generate_tests)
@@ -54,9 +56,9 @@ logger = logging.getLogger(__name__)
 
 # {{{ circle mesh
 
-def test_circle_mesh(do_plot=False):
+def test_circle_mesh(visualize=False):
     from meshmode.mesh.io import generate_gmsh, FileSource
-    print("BEGIN GEN")
+    logger.info("BEGIN GEN")
     mesh = generate_gmsh(
             FileSource("circle.step"), 2, order=2,
             force_ambient_dim=2,
@@ -64,18 +66,145 @@ def test_circle_mesh(do_plot=False):
                 "-string", "Mesh.CharacteristicLengthMax = 0.05;"],
             target_unit="MM",
             )
-    print("END GEN")
-    print(mesh.nelements)
+    logger.info("END GEN")
+    logger.info("nelements: %d", mesh.nelements)
 
     from meshmode.mesh.processing import affine_map
     mesh = affine_map(mesh, A=3*np.eye(2))
 
-    if do_plot:
+    if visualize:
         from meshmode.mesh.visualization import draw_2d_mesh
-        draw_2d_mesh(mesh, fill=None, draw_nodal_adjacency=True,
+        draw_2d_mesh(mesh,
+                fill=None,
+                draw_vertex_numbers=False,
+                draw_nodal_adjacency=True,
                 set_bounding_box=True)
         import matplotlib.pyplot as pt
-        pt.show()
+        pt.axis("equal")
+        pt.savefig("circle_mesh", dpi=300)
+
+# }}}
+
+
+# {{{ test visualizer
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+def test_parallel_vtk_file(ctx_factory, dim):
+    r"""
+    Simple test just generates a sample parallel PVTU file
+    and checks it against the expected result.  The expected
+    result is just a file in the tests directory.
+    """
+    logging.basicConfig(level=logging.INFO)
+
+    cl_ctx = ctx_factory()
+    queue = cl.CommandQueue(cl_ctx)
+    actx = PyOpenCLArrayContext(queue)
+
+    nelements = 64
+    target_order = 4
+
+    if dim == 1:
+        mesh = mgen.make_curve_mesh(
+                mgen.NArmedStarfish(5, 0.25),
+                np.linspace(0.0, 1.0, nelements + 1),
+                target_order)
+    elif dim == 2:
+        mesh = mgen.generate_torus(5.0, 1.0, order=target_order)
+    elif dim == 3:
+        mesh = mgen.generate_warped_rect_mesh(dim, target_order, 5)
+    else:
+        raise ValueError("unknown dimensionality")
+
+    from meshmode.discretization import Discretization
+    discr = Discretization(actx, mesh,
+            InterpolatoryQuadratureSimplexGroupFactory(target_order))
+
+    from meshmode.discretization.visualization import make_visualizer
+    vis = make_visualizer(actx, discr, target_order)
+
+    class FakeComm:
+        def Get_rank(self):  # noqa: N802
+            return 0
+
+        def Get_size(self):  # noqa: N802
+            return 2
+
+    file_name_pattern = f"visualizer_vtk_linear_{dim}_{{rank}}.vtu"
+    pvtu_filename = file_name_pattern.format(rank=0).replace("vtu", "pvtu")
+
+    vis.write_parallel_vtk_file(
+            FakeComm(),
+            file_name_pattern,
+            [
+                ("scalar", discr.zeros(actx)),
+                ("vector", make_obj_array([discr.zeros(actx) for i in range(dim)]))
+                ],
+            overwrite=True)
+
+    import os
+    assert(os.path.exists(pvtu_filename))
+
+    import filecmp
+    assert(filecmp.cmp("ref-"+pvtu_filename, pvtu_filename))
+
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+def test_visualizers(ctx_factory, dim):
+    logging.basicConfig(level=logging.INFO)
+
+    cl_ctx = ctx_factory()
+    queue = cl.CommandQueue(cl_ctx)
+    actx = PyOpenCLArrayContext(queue)
+
+    nelements = 64
+    target_order = 4
+
+    if dim == 1:
+        mesh = mgen.make_curve_mesh(
+                mgen.NArmedStarfish(5, 0.25),
+                np.linspace(0.0, 1.0, nelements + 1),
+                target_order)
+    elif dim == 2:
+        mesh = mgen.generate_torus(5.0, 1.0, order=target_order)
+    elif dim == 3:
+        mesh = mgen.generate_warped_rect_mesh(dim, target_order, 5)
+    else:
+        raise ValueError("unknown dimensionality")
+
+    from meshmode.discretization import Discretization
+    discr = Discretization(actx, mesh,
+            InterpolatoryQuadratureSimplexGroupFactory(target_order))
+
+    from meshmode.discretization.visualization import make_visualizer
+    vis = make_visualizer(actx, discr, target_order)
+
+    vis.write_vtk_file(f"visualizer_vtk_linear_{dim}.vtu",
+            [], overwrite=True)
+
+    with pytest.raises(RuntimeError):
+        vis.write_vtk_file(f"visualizer_vtk_lagrange_{dim}.vtu",
+                [], overwrite=True, use_high_order=True)
+
+    if mesh.dim <= 2:
+        field = thaw(actx, discr.nodes()[0])
+
+    if mesh.dim == 2:
+        try:
+            vis.show_scalar_in_matplotlib_3d(field, do_show=False)
+        except ImportError:
+            logger.info("matplotlib not available")
+
+    if mesh.dim <= 2:
+        try:
+            vis.show_scalar_in_mayavi(field, do_show=False)
+        except ImportError:
+            logger.info("mayavi not avaiable")
+
+    vis = make_visualizer(actx, discr, target_order,
+            force_equidistant=True)
+    vis.write_vtk_file(f"visualizer_vtk_lagrange_{dim}.vtu",
+            [], overwrite=True, use_high_order=True)
 
 # }}}
 
@@ -670,7 +799,7 @@ def test_element_orientation():
     ("ball", lambda: mgen.generate_icosahedron(1, 1)),
     ("torus", lambda: mgen.generate_torus(5, 1)),
     ])
-def test_3d_orientation(ctx_factory, what, mesh_gen_func, visualize=False):
+def test_orientation_3d(ctx_factory, what, mesh_gen_func, visualize=False):
     pytest.importorskip("pytential")
 
     logging.basicConfig(level=logging.INFO)
@@ -685,7 +814,7 @@ def test_3d_orientation(ctx_factory, what, mesh_gen_func, visualize=False):
 
     from meshmode.discretization import Discretization
     discr = Discretization(actx, mesh,
-            PolynomialWarpAndBlendGroupFactory(1))
+            PolynomialWarpAndBlendGroupFactory(3))
 
     from pytential import bind, sym
 
@@ -716,9 +845,9 @@ def test_3d_orientation(ctx_factory, what, mesh_gen_func, visualize=False):
 
     if visualize:
         from meshmode.discretization.visualization import make_visualizer
-        vis = make_visualizer(actx, discr, 1)
+        vis = make_visualizer(actx, discr, 3)
 
-        vis.write_vtk_file("normals.vtu", [
+        vis.write_vtk_file("orientation_3d_%s_normals.vtu" % what, [
             ("normals", normals),
             ])
 
@@ -759,7 +888,7 @@ def test_merge_and_map(ctx_factory, visualize=False):
     from meshmode.mesh.processing import merge_disjoint_meshes, affine_map
     mesh2 = affine_map(mesh,
             A=np.eye(mesh.ambient_dim),
-            b=np.array([5, 0, 0])[:mesh.ambient_dim])
+            b=np.array([2, 0, 0])[:mesh.ambient_dim])
 
     mesh3 = merge_disjoint_meshes((mesh2, mesh))
     mesh3.facial_adjacency_groups
@@ -770,12 +899,12 @@ def test_merge_and_map(ctx_factory, visualize=False):
         from meshmode.discretization import Discretization
         cl_ctx = ctx_factory()
         queue = cl.CommandQueue(cl_ctx)
-
-        discr = Discretization(cl_ctx, mesh3, discr_grp_factory)
+        actx = PyOpenCLArrayContext(queue)
+        discr = Discretization(actx, mesh3, discr_grp_factory)
 
         from meshmode.discretization.visualization import make_visualizer
-        vis = make_visualizer(queue, discr, 3, element_shrink_factor=0.8)
-        vis.write_vtk_file("merged.vtu", [])
+        vis = make_visualizer(actx, discr, 3, element_shrink_factor=0.8)
+        vis.write_vtk_file("merge_and_map.vtu", [])
 
 # }}}
 
@@ -840,20 +969,15 @@ def test_sanity_single_element(ctx_factory, dim, order, visualize=False):
 
     # }}}
 
-    # {{{ visualizers
-
-    from meshmode.discretization.visualization import make_visualizer
-    #vol_vis = make_visualizer(queue, vol_discr, 4)
-    bdry_vis = make_visualizer(actx, bdry_discr, 4)
-
-    # }}}
-
     from pytential import bind, sym
     bdry_normals = bind(bdry_discr, sym.normal(dim))(actx).as_vector(dtype=object)
 
     if visualize:
-        bdry_vis.write_vtk_file("boundary.vtu", [
-            ("bdry_normals", bdry_normals)
+        from meshmode.discretization.visualization import make_visualizer
+        bdry_vis = make_visualizer(actx, bdry_discr, 4)
+
+        bdry_vis.write_vtk_file("sanity_single_element_boundary.vtu", [
+            ("normals", bdry_normals)
             ])
 
     normal_outward_check = bind(bdry_discr,
@@ -970,14 +1094,6 @@ def test_sanity_balls(ctx_factory, src_file, dim, mesh_order, visualize=False):
 
         # }}}
 
-        # {{{ visualizers
-
-        from meshmode.discretization.visualization import make_visualizer
-        vol_vis = make_visualizer(actx, vol_discr, 20)
-        bdry_vis = make_visualizer(actx, bdry_discr, 20)
-
-        # }}}
-
         from math import gamma
         true_surf = 2*np.pi**(dim/2)/gamma(dim/2)
         true_vol = true_surf/dim
@@ -1006,14 +1122,22 @@ def test_sanity_balls(ctx_factory, src_file, dim, mesh_order, visualize=False):
         print("SURF", true_surf, comp_surf)
 
         if visualize:
-            vol_vis.write_vtk_file("volume-h=%g.vtu" % h, [
+            from meshmode.discretization.visualization import make_visualizer
+            vol_vis = make_visualizer(actx, vol_discr, 7)
+            bdry_vis = make_visualizer(actx, bdry_discr, 7)
+
+            name = src_file.split("-")[0]
+            vol_vis.write_vtk_file("sanity_balls_volume_%s_%g.vtu" % (name, h), [
                 ("f", vol_one),
                 ("area_el", bind(
                     vol_discr,
                     sym.area_element(mesh.ambient_dim, mesh.ambient_dim))
                     (actx)),
                 ])
-            bdry_vis.write_vtk_file("boundary-h=%g.vtu" % h, [("f", bdry_one)])
+
+            bdry_vis.write_vtk_file("sanity_balls_boundary_%s_%g.vtu" % (name, h), [
+                ("f", bdry_one)
+                ])
 
         # {{{ check normals point outward
 
@@ -1043,11 +1167,11 @@ def test_sanity_balls(ctx_factory, src_file, dim, mesh_order, visualize=False):
 
 # {{{ rect/box mesh generation
 
-def test_rect_mesh(do_plot=False):
+def test_rect_mesh(visualize=False):
     from meshmode.mesh.generation import generate_regular_rect_mesh
     mesh = generate_regular_rect_mesh()
 
-    if do_plot:
+    if visualize:
         from meshmode.mesh.visualization import draw_2d_mesh
         draw_2d_mesh(mesh, fill=None, draw_nodal_adjacency=True)
         import matplotlib.pyplot as pt
@@ -1064,13 +1188,14 @@ def test_box_mesh(ctx_factory, visualize=False):
                 PolynomialWarpAndBlendGroupFactory
         cl_ctx = ctx_factory()
         queue = cl.CommandQueue(cl_ctx)
+        actx = PyOpenCLArrayContext(queue)
 
-        discr = Discretization(cl_ctx, mesh,
-                PolynomialWarpAndBlendGroupFactory(1))
+        discr = Discretization(actx, mesh,
+                PolynomialWarpAndBlendGroupFactory(7))
 
         from meshmode.discretization.visualization import make_visualizer
-        vis = make_visualizer(queue, discr, 1)
-        vis.write_vtk_file("box.vtu", [])
+        vis = make_visualizer(actx, discr, 7)
+        vis.write_vtk_file("box_mesh.vtu", [])
 
 # }}}
 
@@ -1107,7 +1232,7 @@ def test_as_python():
 
 # {{{ test lookup tree for element finding
 
-def test_lookup_tree(do_plot=False):
+def test_lookup_tree(visualize=False):
     from meshmode.mesh.generation import make_curve_mesh, cloverleaf
     mesh = make_curve_mesh(cloverleaf, np.linspace(0, 1, 1000), order=3)
 
@@ -1125,7 +1250,7 @@ def test_lookup_tree(do_plot=False):
         for igrp, iel in tree.generate_matches(pt):
             print(igrp, iel)
 
-    if do_plot:
+    if visualize:
         with open("tree.dat", "w") as outf:
             tree.visualize(outf)
 
@@ -1271,7 +1396,7 @@ def test_vtk_overwrite(ctx_factory):
         import os
         from meshmode import FileExistsError
 
-        filename = "test_vtk_overwrite.vtu"
+        filename = "vtk_overwrite_temp.vtu"
         if os.path.exists(filename):
             os.remove(filename)
 
@@ -1522,13 +1647,12 @@ def test_mesh_multiple_groups(ctx_factory, ambient_dim, visualize=False):
 
     if visualize:
         group_id = discr.empty(actx, dtype=np.int)
-        for igrp, grp in enumerate(discr.groups):
-            group_id_view = grp.view(group_id)
-            group_id_view.fill(igrp)
+        for igrp, vec in enumerate(group_id):
+            vec.fill(igrp)
 
         from meshmode.discretization.visualization import make_visualizer
         vis = make_visualizer(actx, discr, vis_order=order)
-        vis.write_vtk_file("test_mesh_multiple_groups.vtu", [
+        vis.write_vtk_file("mesh_multiple_groups.vtu", [
             ("group_id", group_id)
             ], overwrite=True)
 
@@ -1594,6 +1718,44 @@ def test_array_context_np_workalike(ctx_factory):
                 flatten(getattr(actx.np, sym_name)(*actx_args)))
 
         assert np.allclose(actx_result, ref_result)
+
+
+def test_dof_array_comparison(ctx_factory):
+    ctx = ctx_factory()
+    queue = cl.CommandQueue(ctx)
+    actx = PyOpenCLArrayContext(queue)
+
+    from meshmode.mesh.generation import generate_regular_rect_mesh
+    mesh = generate_regular_rect_mesh(
+            a=(-0.5,)*2, b=(0.5,)*2, n=(8,)*2, order=3)
+
+    from meshmode.discretization import Discretization
+    from meshmode.discretization.poly_element import \
+            PolynomialWarpAndBlendGroupFactory as GroupFactory
+    discr = Discretization(actx, mesh, GroupFactory(3))
+
+    import operator
+    for op in [
+            operator.lt,
+            operator.le,
+            operator.gt,
+            operator.ge,
+            ]:
+        np_arg = np.random.randn(discr.ndofs)
+        arg = unflatten(actx, discr, actx.from_numpy(np_arg))
+        zeros = discr.zeros(actx)
+
+        comp = op(arg, zeros)
+        np_comp = actx.to_numpy(flatten(comp))
+        assert np.array_equal(np_comp, op(np_arg, 0))
+
+        comp = op(arg, 0)
+        np_comp = actx.to_numpy(flatten(comp))
+        assert np.array_equal(np_comp, op(np_arg, 0))
+
+        comp = op(0, arg)
+        np_comp = actx.to_numpy(flatten(comp))
+        assert np.array_equal(np_comp, op(0, np_arg))
 
 
 if __name__ == "__main__":
