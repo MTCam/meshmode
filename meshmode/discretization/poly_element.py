@@ -1,5 +1,3 @@
-from __future__ import division
-
 __copyright__ = "Copyright (C) 2013 Andreas Kloeckner"
 
 __license__ = """
@@ -42,6 +40,7 @@ Group types
 .. autoclass:: PolynomialWarpAndBlendElementGroup
 .. autoclass:: PolynomialRecursiveNodesElementGroup
 .. autoclass:: PolynomialEquidistantSimplexElementGroup
+.. autoclass:: PolynomialGivenNodesElementGroup
 .. autoclass:: LegendreGaussLobattoTensorProductElementGroup
 .. autoclass:: EquidistantTensorProductElementGroup
 
@@ -54,6 +53,7 @@ Group factories
 .. autoclass:: PolynomialWarpAndBlendGroupFactory
 .. autoclass:: PolynomialRecursiveNodesGroupFactory
 .. autoclass:: PolynomialEquidistantSimplexGroupFactory
+.. autoclass:: PolynomialGivenNodesGroupFactory
 .. autoclass:: LegendreGaussLobattoTensorProductGroupFactory
 """
 
@@ -314,6 +314,33 @@ class PolynomialEquidistantSimplexElementGroup(_MassMatrixQuadratureElementGroup
         assert dim2 == dim
         return result
 
+
+class PolynomialGivenNodesElementGroup(_MassMatrixQuadratureElementGroup):
+    """Elemental discretization with a number of nodes matching the number of
+    polynomials in :math:`P^k`, hence usable for differentiation and
+    interpolation. Uses nodes given by the user.
+    """
+    def __init__(self, mesh_el_group, order, unit_nodes, index):
+        super().__init__(mesh_el_group, order, index)
+        self._unit_nodes = unit_nodes
+
+    @property
+    def unit_nodes(self):
+        dim2, nunit_nodes = self._unit_nodes.shape
+
+        if dim2 != self.mesh_el_group.dim:
+            raise ValueError("unit nodes supplied to "
+                    "PolynomialGivenNodesElementGroup do not have expected "
+                    "dimensionality")
+
+        if nunit_nodes != len(self.basis()):
+            raise ValueError("unit nodes supplied to "
+                    "PolynomialGivenNodesElementGroup do not have expected "
+                    "node count for provided order")
+
+        return self._unit_nodes
+
+
 # }}}
 
 
@@ -358,14 +385,14 @@ class EquidistantTensorProductElementGroup(
     def unit_nodes(self):
         from modepy.nodes import tensor_product_nodes, equidistant_nodes
         return tensor_product_nodes(
-                self.dim, equidistant_nodes(1, self.order))
+                self.dim, equidistant_nodes(1, self.order)[0])
 
 # }}}
 
 
 # {{{ group factories
 
-class ElementGroupFactory(object):
+class ElementGroupFactory:
     """
     .. function:: __call__(mesh_ele_group, node_nr_base)
     """
@@ -443,6 +470,19 @@ class PolynomialEquidistantSimplexGroupFactory(HomogeneousOrderBasedGroupFactory
     mesh_group_class = _MeshSimplexElementGroup
     group_class = PolynomialEquidistantSimplexElementGroup
 
+
+class PolynomialGivenNodesGroupFactory(HomogeneousOrderBasedGroupFactory):
+    def __init__(self, order, unit_nodes):
+        self.order = order
+        self.unit_nodes = unit_nodes
+
+    def __call__(self, mesh_el_group, index):
+        if not isinstance(mesh_el_group, _MeshSimplexElementGroup):
+            raise TypeError("only mesh element groups of type '%s' "
+                    "are supported" % _MeshSimplexElementGroup.__name__)
+
+        return PolynomialGivenNodesElementGroup(
+                mesh_el_group, self.order, self.unit_nodes, index)
 # }}}
 
 

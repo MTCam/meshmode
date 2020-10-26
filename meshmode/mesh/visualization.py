@@ -1,5 +1,3 @@
-from __future__ import division, absolute_import
-
 __copyright__ = "Copyright (C) 2014 Andreas Kloeckner"
 
 __license__ = """
@@ -23,7 +21,6 @@ THE SOFTWARE.
 """
 
 import numpy as np
-from six.moves import range
 
 __doc__ = """
 .. autofunction:: draw_2d_mesh
@@ -78,13 +75,13 @@ def draw_2d_mesh(mesh, draw_vertex_numbers=True, draw_element_numbers=True,
 
                 pt.text(centroid[0], centroid[1], el_label, fontsize=17,
                         ha="center", va="center",
-                        bbox=dict(facecolor='white', alpha=0.5, lw=0))
+                        bbox=dict(facecolor="white", alpha=0.5, lw=0))
 
     if draw_vertex_numbers:
         for ivert, vert in enumerate(mesh.vertices.T):
             pt.text(vert[0], vert[1], str(ivert), fontsize=15,
                     ha="center", va="center", color="blue",
-                    bbox=dict(facecolor='white', alpha=0.5, lw=0))
+                    bbox=dict(facecolor="white", alpha=0.5, lw=0))
 
     if draw_nodal_adjacency:
         def global_iel_to_group_and_iel(global_iel):
@@ -135,7 +132,7 @@ def draw_2d_mesh(mesh, draw_vertex_numbers=True, draw_element_numbers=True,
 
                     pt.text(face_center[0], face_center[1], str(iface), fontsize=12,
                             ha="center", va="center", color="purple",
-                            bbox=dict(facecolor='white', alpha=0.5, lw=0))
+                            bbox=dict(facecolor="white", alpha=0.5, lw=0))
 
     if set_bounding_box:
         from meshmode.mesh.processing import find_bounding_box
@@ -215,18 +212,42 @@ def write_vertex_vtk_file(mesh, file_name,
 
     # }}}
 
+    # {{{ create cell connectivity
+
+    cells = np.empty(
+            sum(egrp.vertex_indices.size for egrp in mesh.groups),
+            dtype=mesh.vertex_id_dtype)
+
+    # NOTE: vtk uses z-order for the linear quads
+    tensor_order = {
+            1: (0, 1),
+            2: (0, 1, 3, 2),
+            3: (0, 1, 3, 2, 4, 5, 7, 6)
+            }
+
+    vertex_nr_base = 0
+    for egrp in mesh.groups:
+        i = np.s_[vertex_nr_base:vertex_nr_base + egrp.vertex_indices.size]
+        if isinstance(egrp, SimplexElementGroup):
+            cells[i] = egrp.vertex_indices.reshape(-1)
+        elif isinstance(egrp, TensorProductElementGroup):
+            cells[i] = egrp.vertex_indices[:, tensor_order[egrp.dim]].reshape(-1)
+        else:
+            raise TypeError("unsupported group type")
+
+        vertex_nr_base += egrp.vertex_indices.size
+
+    # }}}
+
     grid = UnstructuredGrid(
             (mesh.nvertices,
                 DataArray("points",
                     mesh.vertices,
                     vector_format=VF_LIST_OF_COMPONENTS)),
-            cells=np.hstack([
-                vgrp.vertex_indices.reshape(-1)
-                for vgrp in mesh.groups]),
+            cells=cells,
             cell_types=cell_types)
 
     import os
-    from meshmode import FileExistsError
     if os.path.exists(file_name):
         if overwrite:
             os.remove(file_name)

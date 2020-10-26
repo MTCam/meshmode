@@ -1,5 +1,3 @@
-from __future__ import division
-
 __copyright__ = "Copyright (C) 2014 Andreas Kloeckner"
 
 __license__ = """
@@ -29,8 +27,6 @@ __doc__ = """
 .. exception:: FileExistsError
 """
 
-import six
-
 
 class Error(RuntimeError):
     pass
@@ -40,8 +36,16 @@ class DataUnavailable(Error):
     pass
 
 
-if six.PY3:
-    from builtins import FileExistsError
-else:
-    class FileExistsError(OSError):
-        pass
+from builtins import FileExistsError  # noqa: F401
+
+
+def _acf():
+    """A tiny undocumented function to pass to tests that take an ``actx_factory``
+    argument when running them from the command line.
+    """
+    import pyopencl as cl
+    from meshmode.array_context import PyOpenCLArrayContext
+
+    context = cl._csc()
+    queue = cl.CommandQueue(context)
+    return PyOpenCLArrayContext(queue)

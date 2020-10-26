@@ -1,5 +1,3 @@
-from __future__ import division, absolute_import, print_function
-
 __copyright__ = "Copyright (C) 2014 Andreas Kloeckner"
 
 __license__ = """
@@ -23,12 +21,12 @@ THE SOFTWARE.
 """
 
 from functools import partial
-from six.moves import range
 import numpy as np
 import numpy.linalg as la
 
 from pytools.obj_array import make_obj_array
 
+import meshmode         # noqa: F401
 from meshmode.array_context import (  # noqa
         pytest_generate_tests_for_pyopencl_array_context
         as pytest_generate_tests)
@@ -39,6 +37,7 @@ from meshmode.discretization.poly_element import (
         PolynomialWarpAndBlendGroupFactory,
         PolynomialRecursiveNodesGroupFactory,
         PolynomialEquidistantSimplexGroupFactory,
+        LegendreGaussLobattoTensorProductGroupFactory
         )
 from meshmode.mesh import Mesh, BTAG_ALL
 from meshmode.dof_array import thaw, flat_norm, flatten, unflatten
@@ -145,60 +144,86 @@ def test_parallel_vtk_file(actx_factory, dim):
     assert(filecmp.cmp("ref-"+pvtu_filename, pvtu_filename))
 
 
-@pytest.mark.parametrize("dim", [1, 2, 3])
-def test_visualizers(actx_factory, dim):
-    logging.basicConfig(level=logging.INFO)
-
+@pytest.mark.parametrize(("dim", "group_factory"), [
+    (1, SimplexElementGroup),
+    (2, SimplexElementGroup),
+    (3, SimplexElementGroup),
+    (2, TensorProductElementGroup),
+    (3, TensorProductElementGroup),
+    ])
+def test_visualizers(actx_factory, dim, group_factory):
     actx = actx_factory()
 
     nelements = 64
     target_order = 4
 
+    is_simplex = issubclass(group_factory, SimplexElementGroup)
     if dim == 1:
         mesh = mgen.make_curve_mesh(
                 mgen.NArmedStarfish(5, 0.25),
                 np.linspace(0.0, 1.0, nelements + 1),
                 target_order)
     elif dim == 2:
-        mesh = mgen.generate_torus(5.0, 1.0, order=target_order)
+        if is_simplex:
+            mesh = mgen.generate_torus(5.0, 1.0, order=target_order)
+        else:
+            mesh = mgen.generate_regular_rect_mesh(
+                    a=(0,)*dim, b=(1,)*dim, n=(5,)*dim,
+                    group_factory=group_factory,
+                    order=target_order)
     elif dim == 3:
-        mesh = mgen.generate_warped_rect_mesh(dim, target_order, 5)
+        if is_simplex:
+            mesh = mgen.generate_warped_rect_mesh(dim, target_order, 5)
+        else:
+            mesh = mgen.generate_regular_rect_mesh(
+                    a=(0,)*dim, b=(1,)*dim, n=(5,)*dim,
+                    group_factory=group_factory,
+                    order=target_order)
     else:
         raise ValueError("unknown dimensionality")
 
+    if is_simplex:
+        discr_group_factory = InterpolatoryQuadratureSimplexGroupFactory
+    else:
+        discr_group_factory = LegendreGaussLobattoTensorProductGroupFactory
+
     from meshmode.discretization import Discretization
-    discr = Discretization(actx, mesh,
-            InterpolatoryQuadratureSimplexGroupFactory(target_order))
+    discr = Discretization(actx, mesh, discr_group_factory(target_order))
+
+    nodes = thaw(actx, discr.nodes())
+    f = actx.np.sqrt(sum(nodes**2))
 
     from meshmode.discretization.visualization import make_visualizer
     vis = make_visualizer(actx, discr, target_order)
 
-    vis.write_vtk_file(f"visualizer_vtk_linear_{dim}.vtu",
-            [], overwrite=True)
+    if is_simplex:
+        basename = f"visualizer_vtk_simplex_{dim}d"
+    else:
+        basename = f"visualizer_vtk_box_{dim}d"
+
+    vis.write_vtk_file(f"{basename}_linear.vtu",
+            [("f", f)], overwrite=True)
 
     with pytest.raises(RuntimeError):
-        vis.write_vtk_file(f"visualizer_vtk_lagrange_{dim}.vtu",
-                [], overwrite=True, use_high_order=True)
+        vis.write_vtk_file(f"{basename}_lagrange.vtu",
+                [("f", f)], overwrite=True, use_high_order=True)
 
-    if mesh.dim <= 2:
-        field = thaw(actx, discr.nodes()[0])
-
-    if mesh.dim == 2:
+    if mesh.dim == 2 and is_simplex:
         try:
-            vis.show_scalar_in_matplotlib_3d(field, do_show=False)
+            vis.show_scalar_in_matplotlib_3d(f, do_show=False)
         except ImportError:
             logger.info("matplotlib not available")
 
-    if mesh.dim <= 2:
+    if mesh.dim <= 2 and is_simplex:
         try:
-            vis.show_scalar_in_mayavi(field, do_show=False)
+            vis.show_scalar_in_mayavi(f, do_show=False)
         except ImportError:
             logger.info("mayavi not avaiable")
 
     vis = make_visualizer(actx, discr, target_order,
             force_equidistant=True)
-    vis.write_vtk_file(f"visualizer_vtk_lagrange_{dim}.vtu",
-            [], overwrite=True, use_high_order=True)
+    vis.write_vtk_file(f"{basename}_lagrange.vtu",
+            [("f", f)], overwrite=True, use_high_order=True)
 
 # }}}
 
@@ -208,10 +233,10 @@ def test_visualizers(actx_factory, dim):
 def test_boundary_tags():
     from meshmode.mesh.io import read_gmsh
     # ensure tags are read in
-    mesh = read_gmsh('annulus.msh')
-    if not {'outer_bdy', 'inner_bdy'} <= set(mesh.boundary_tags):
+    mesh = read_gmsh("annulus.msh")
+    if not {"outer_bdy", "inner_bdy"} <= set(mesh.boundary_tags):
         print("Mesh boundary tags:", mesh.boundary_tags)
-        raise ValueError('Tags not saved by mesh')
+        raise ValueError("Tags not saved by mesh")
 
     # correct answers
     num_on_outer_bdy = 26
@@ -220,8 +245,8 @@ def test_boundary_tags():
     # check how many elements are marked on each boundary
     num_marked_outer_bdy = 0
     num_marked_inner_bdy = 0
-    outer_btag_bit = mesh.boundary_tag_bit('outer_bdy')
-    inner_btag_bit = mesh.boundary_tag_bit('inner_bdy')
+    outer_btag_bit = mesh.boundary_tag_bit("outer_bdy")
+    inner_btag_bit = mesh.boundary_tag_bit("inner_bdy")
     for igrp in range(len(mesh.groups)):
         bdry_fagrp = mesh.facial_adjacency_groups[igrp].get(None, None)
 
@@ -245,25 +270,26 @@ def test_boundary_tags():
 
     # ensure boundary is covered
     from meshmode.mesh import check_bc_coverage
-    check_bc_coverage(mesh, ['inner_bdy', 'outer_bdy'])
+    check_bc_coverage(mesh, ["inner_bdy", "outer_bdy"])
 
 # }}}
 
 
 # {{{ test custom boundary tags on box mesh
 
-@pytest.mark.parametrize(("dim", "nelem"), [
-    (1, 20),
-    (2, 20),
-    (3, 10),
+@pytest.mark.parametrize(("dim", "nelem", "mesh_type"), [
+    (1, 20, None),
+    (2, 20, None),
+    (2, 20, "X"),
+    (3, 10, None),
     ])
-@pytest.mark.parametrize("group_factory", [
+@pytest.mark.parametrize("group_cls", [
     SimplexElementGroup,
 
     # FIXME: Not implemented: TPE.face_vertex_indices
     # TensorProductElementGroup
     ])
-def test_box_boundary_tags(dim, nelem, group_factory):
+def test_box_boundary_tags(dim, nelem, mesh_type, group_cls, visualize=False):
     from meshmode.mesh.generation import generate_regular_rect_mesh
     from meshmode.mesh import is_boundary_tag_empty
     from meshmode.mesh import check_bc_coverage
@@ -288,7 +314,15 @@ def test_box_boundary_tags(dim, nelem, group_factory):
     mesh = generate_regular_rect_mesh(a=a, b=b,
                                       n=n, order=3,
                                       boundary_tag_to_face=btag_to_face,
-                                      group_factory=group_factory)
+                                      group_cls=group_cls,
+                                      mesh_type=mesh_type)
+
+    if visualize:
+        from meshmode.mesh.visualization import draw_2d_mesh
+        draw_2d_mesh(mesh, draw_element_numbers=False, draw_vertex_numbers=False)
+        import matplotlib.pyplot as plt
+        plt.show()
+
     # correct answer
     if dim == 1:
         num_on_bdy = 1
@@ -297,7 +331,7 @@ def test_box_boundary_tags(dim, nelem, group_factory):
 
     assert not is_boundary_tag_empty(mesh, "btag_test_1")
     assert not is_boundary_tag_empty(mesh, "btag_test_2")
-    check_bc_coverage(mesh, ['btag_test_1', 'btag_test_2'])
+    check_bc_coverage(mesh, ["btag_test_1", "btag_test_2"])
 
     # check how many elements are marked on each boundary
     num_marked_bdy_1 = 0
@@ -672,7 +706,7 @@ def test_element_orientation():
 
 # {{{ element orientation: canned 3D meshes
 
-# python test_meshmode.py 'test_sanity_balls(cl._csc, "disk-radius-1.step", 2, 2, visualize=True)'  # noqa
+# python test_meshmode.py "test_sanity_balls(cl._csc, "disk-radius-1.step", 2, 2, visualize=True)"  # noqa
 @pytest.mark.parametrize(("what", "mesh_gen_func"), [
     ("ball", lambda: mgen.generate_icosahedron(1, 1)),
     ("torus", lambda: mgen.generate_torus(5, 1)),
@@ -731,16 +765,22 @@ def test_orientation_3d(actx_factory, what, mesh_gen_func, visualize=False):
 
 # {{{ merge and map
 
-def test_merge_and_map(actx_factory, visualize=False):
+@pytest.mark.parametrize("group_cls", [
+    SimplexElementGroup,
+
+    # NOTE: needs TensorProductElementGroup.face_vertex_indices
+    # TensorProductElementGroup
+    ])
+def test_merge_and_map(actx_factory, group_cls, visualize=False):
     from meshmode.mesh.io import generate_gmsh, FileSource
-    from meshmode.mesh.generation import generate_box_mesh
     from meshmode.discretization.poly_element import (
             PolynomialWarpAndBlendGroupFactory,
             LegendreGaussLobattoTensorProductGroupFactory)
 
+    order = 3
     mesh_order = 3
 
-    if 1:
+    if group_cls is SimplexElementGroup:
         mesh = generate_gmsh(
                 FileSource("blob-2d.step"), 2, order=mesh_order,
                 force_ambient_dim=2,
@@ -748,17 +788,14 @@ def test_merge_and_map(actx_factory, visualize=False):
                 target_unit="MM",
                 )
 
-        discr_grp_factory = PolynomialWarpAndBlendGroupFactory(3)
+        discr_grp_factory = PolynomialWarpAndBlendGroupFactory(order)
     else:
-        mesh = generate_box_mesh(
-                (
-                    np.linspace(0, 1, 4),
-                    np.linspace(0, 1, 4),
-                    np.linspace(0, 1, 4),
-                    ),
-                10, group_factory=TensorProductElementGroup)
+        ambient_dim = 3
+        mesh = mgen.generate_regular_rect_mesh(
+                a=(0,)*ambient_dim, b=(1,)*ambient_dim, n=(4,)*ambient_dim,
+                order=mesh_order, group_cls=group_cls)
 
-        discr_grp_factory = LegendreGaussLobattoTensorProductGroupFactory(3)
+        discr_grp_factory = LegendreGaussLobattoTensorProductGroupFactory(order)
 
     from meshmode.mesh.processing import merge_disjoint_meshes, affine_map
     mesh2 = affine_map(mesh,
@@ -911,7 +948,7 @@ def test_sanity_qhull_nd(actx_factory, dim, order):
 
 # {{{ sanity checks: ball meshes
 
-# python test_meshmode.py 'test_sanity_balls(cl._csc, "disk-radius-1.step", 2, 2, visualize=True)'  # noqa
+# python test_meshmode.py "test_sanity_balls(cl._csc, "disk-radius-1.step", 2, 2, visualize=True)"  # noqa
 @pytest.mark.parametrize(("src_file", "dim"), [
     ("disk-radius-1.step", 2),
     ("ball-radius-1.step", 3),
@@ -991,7 +1028,7 @@ def test_sanity_balls(actx_factory, src_file, dim, mesh_order, visualize=False):
             bdry_vis = make_visualizer(actx, bdry_discr, 7)
 
             name = src_file.split("-")[0]
-            vol_vis.write_vtk_file("sanity_balls_volume_%s_%g.vtu" % (name, h), [
+            vol_vis.write_vtk_file(f"sanity_balls_volume_{name}_{h:g}.vtu", [
                 ("f", vol_one),
                 ("area_el", bind(
                     vol_discr,
@@ -999,7 +1036,7 @@ def test_sanity_balls(actx_factory, src_file, dim, mesh_order, visualize=False):
                     (actx)),
                 ])
 
-            bdry_vis.write_vtk_file("sanity_balls_boundary_%s_%g.vtu" % (name, h), [
+            bdry_vis.write_vtk_file(f"sanity_balls_boundary_{name}_{h:g}.vtu", [
                 ("f", bdry_one)
                 ])
 
@@ -1145,24 +1182,52 @@ def test_nd_quad_submesh(dims):
 
 # {{{ test_quad_mesh_2d
 
-def test_quad_mesh_2d():
+@pytest.mark.parametrize(("ambient_dim", "filename"),
+        [(2, "blob-2d.step"), (3, "ball-radius-1.step")])
+def test_quad_mesh_2d(ambient_dim, filename, visualize=False):
     from meshmode.mesh.io import generate_gmsh, ScriptWithFilesSource
-    print("BEGIN GEN")
+    logger.info("BEGIN GEN")
+
     mesh = generate_gmsh(
             ScriptWithFilesSource(
-                """
-                Merge "blob-2d.step";
+                f"""
+                Merge "{filename}";
                 Mesh.CharacteristicLengthMax = 0.05;
                 Recombine Surface "*" = 0.0001;
                 Mesh 2;
                 Save "output.msh";
                 """,
-                ["blob-2d.step"]),
-            force_ambient_dim=2,
+                [filename]),
+            order=1,
+            force_ambient_dim=ambient_dim,
             target_unit="MM",
             )
-    print("END GEN")
-    print(mesh.nelements)
+
+    logger.info("END GEN")
+    logger.info("nelements: %d", mesh.nelements)
+
+    from meshmode.mesh.generation import make_group_from_vertices
+    groups = []
+    for grp in mesh.groups:
+        if not isinstance(grp, TensorProductElementGroup):
+            # NOTE: gmsh isn't guaranteed to recombine all elements, so we
+            # could still have some simplices sitting around, so skip them
+            groups.append(grp.copy())
+            continue
+
+        g = make_group_from_vertices(mesh.vertices,
+                grp.vertex_indices, grp.order,
+                group_cls=TensorProductElementGroup)
+        assert g.nodes.shape == (mesh.ambient_dim, grp.nelements, grp.nunit_nodes)
+
+        groups.append(g)
+
+    mesh_from_vertices = Mesh(mesh.vertices, groups=groups, is_conforming=True)
+
+    if visualize:
+        from meshmode.mesh.visualization import write_vertex_vtk_file
+        write_vertex_vtk_file(mesh, "quad_mesh_2d_orig.vtu")
+        write_vertex_vtk_file(mesh_from_vertices, "quad_mesh_2d_groups.vtu")
 
 # }}}
 
@@ -1213,7 +1278,7 @@ def test_quad_single_element():
     mg = make_group_from_vertices(
             vertices,
             np.array([[0, 1, 2, 3]], dtype=np.int32),
-            30, group_factory=TensorProductElementGroup)
+            30, group_cls=TensorProductElementGroup)
 
     Mesh(vertices, [mg], nodal_adjacency=None, facial_adjacency_groups=None)
     if 0:
@@ -1228,7 +1293,7 @@ def test_quad_single_element():
 
 # {{{ test_quad_multi_element
 
-def test_quad_multi_element():
+def test_quad_multi_element(visualize=False):
     from meshmode.mesh.generation import generate_box_mesh
     mesh = generate_box_mesh(
             (
@@ -1236,9 +1301,9 @@ def test_quad_multi_element():
                 np.linspace(3, 8, 4),
                 np.linspace(3, 8, 4),
                 ),
-            10, group_factory=TensorProductElementGroup)
+            10, group_cls=TensorProductElementGroup)
 
-    if 0:
+    if visualize:
         import matplotlib.pyplot as plt
         mg = mesh.groups[0]
         plt.plot(
@@ -1256,7 +1321,6 @@ def test_vtk_overwrite(actx_factory):
 
     def _try_write_vtk(writer, obj):
         import os
-        from meshmode import FileExistsError
 
         filename = "vtk_overwrite_temp.vtu"
         if os.path.exists(filename):
@@ -1457,7 +1521,7 @@ def test_is_affine_group_check(mesh_name):
         is_affine = False
         mesh = generate_torus(10.0, 2.0, order=order)
     else:
-        raise ValueError("unknown mesh name: {}".format(mesh_name))
+        raise ValueError(f"unknown mesh name: {mesh_name}")
 
     assert all(grp.is_affine for grp in mesh.groups) == is_affine
 

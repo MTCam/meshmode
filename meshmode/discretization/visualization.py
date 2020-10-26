@@ -174,8 +174,8 @@ class VTKConnectivity:
 
         elif isinstance(grp.mesh_el_group, TensorProductElementGroup):
             node_tuples = list(gnitb(grp.order+1, grp.dim))
-            node_tuple_to_index = dict(
-                    (nt, i) for i, nt in enumerate(node_tuples))
+            node_tuple_to_index = {
+                    nt: i for i, nt in enumerate(node_tuples)}
 
             def add_tuple(a, b):
                 return tuple(ai+bi for ai, bi in zip(a, b))
@@ -256,9 +256,6 @@ class VTKLagrangeConnectivity(VTKConnectivity):
 
     @property
     def version(self):
-        # NOTE: version 2.2 has an updated ordering for the hexahedron
-        # elements that is not supported currently
-        # https://gitlab.kitware.com/vtk/vtk/-/merge_requests/6678
         return "2.0"
 
     @property
@@ -280,20 +277,34 @@ class VTKLagrangeConnectivity(VTKConnectivity):
                 }
 
     def connectivity_for_element_group(self, grp):
-        from meshmode.mesh import SimplexElementGroup
+        from meshmode.mesh import SimplexElementGroup, TensorProductElementGroup
 
+        vtk_version = tuple(int(v) for v in self.version.split("."))
         if isinstance(grp.mesh_el_group, SimplexElementGroup):
             from pyvisfile.vtk.vtk_ordering import (
                     vtk_lagrange_simplex_node_tuples,
                     vtk_lagrange_simplex_node_tuples_to_permutation)
 
             node_tuples = vtk_lagrange_simplex_node_tuples(
-                    grp.dim, grp.order, is_consistent=True)
+                    grp.dim, grp.order, vtk_version=vtk_version)
             el_connectivity = np.array(
                     vtk_lagrange_simplex_node_tuples_to_permutation(node_tuples),
                     dtype=np.intp).reshape(1, 1, -1)
 
             vtk_cell_type = self.simplex_cell_types[grp.dim]
+
+        elif isinstance(grp.mesh_el_group, TensorProductElementGroup):
+            from pyvisfile.vtk.vtk_ordering import (
+                    vtk_lagrange_quad_node_tuples,
+                    vtk_lagrange_quad_node_tuples_to_permutation)
+
+            node_tuples = vtk_lagrange_quad_node_tuples(
+                    grp.dim, grp.order, vtk_version=vtk_version)
+            el_connectivity = np.array(
+                    vtk_lagrange_quad_node_tuples_to_permutation(node_tuples),
+                    dtype=np.intp).reshape(1, 1, -1)
+
+            vtk_cell_type = self.tensor_cell_types[grp.dim]
 
         else:
             raise NotImplementedError("visualization for element groups "
@@ -334,7 +345,7 @@ class VTKLagrangeConnectivity(VTKConnectivity):
 
 # {{{ visualizer
 
-class Visualizer(object):
+class Visualizer:
     """
     .. automethod:: show_scalar_in_mayavi
     .. automethod:: show_scalar_in_matplotlib_3d
@@ -463,7 +474,7 @@ class Visualizer(object):
                 raise ValueError("file_name_pattern must produce file names "
                         "ending in '.vtu'")
 
-            par_manifest_filename = par_manifest_filename[:-4] + '.pvtu'
+            par_manifest_filename = par_manifest_filename[:-4] + ".pvtu"
 
         self.write_vtk_file(
                 file_name=file_name_pattern.format(rank=rank),
@@ -496,6 +507,11 @@ class Visualizer(object):
             *value* may also be a data class (see :mod:`dataclasses`),
             whose attributes will be inserted into the visualization
             with their names prefixed by *name*.
+            If *value* is *None*, then there is no data to write and the
+            corresponding *name* will not appear in the data file.
+            If *value* is *None*, it should be *None* collectively across all
+            ranks for parallel writes; otherwise the behavior of this routine
+            is undefined.
         :arg overwrite: If *True*, silently overwrite existing
             files.
         :arg use_high_order: Writes arbitrary order Lagrange VTK elements.
@@ -543,8 +559,9 @@ class Visualizer(object):
                 new_names_and_fields.extend(
                         (f"{name}_{dclass_field.name}",
                             getattr(fld, dclass_field.name))
-                        for dclass_field in dataclasses.fields(fld))
-            else:
+                        for dclass_field in dataclasses.fields(fld)
+                        if getattr(fld, dclass_field.name) is not None)
+            elif fld is not None:
                 new_names_and_fields.append((name, fld))
 
         names_and_fields = new_names_and_fields
@@ -610,11 +627,9 @@ class Visualizer(object):
 
         # {{{ write
 
-        import os
-        from meshmode import FileExistsError
-
         # {{{ write either both the vis file and the manifest, or neither
 
+        import os
         responsible_for_writing_par_manifest = (
                 par_file_names
                 and par_file_names[0] == file_name)
@@ -837,7 +852,6 @@ def write_nodal_adjacency_vtk_file(file_name, mesh,
                 dtype=np.uint8))
 
     import os
-    from meshmode import FileExistsError
     if os.path.exists(file_name):
         if overwrite:
             os.remove(file_name)

@@ -1,5 +1,3 @@
-from __future__ import division, absolute_import
-
 __copyright__ = "Copyright (C) 2013 Andreas Kloeckner"
 
 __license__ = """
@@ -22,12 +20,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
-from six.moves import range
 
 import numpy as np
 import numpy.linalg as la
 import modepy as mp
 
+from pytools import deprecate_keyword
 import logging
 logger = logging.getLogger(__name__)
 
@@ -184,7 +182,7 @@ def apple(a, t):
         ])
 
 
-class WobblyCircle(object):
+class WobblyCircle:
     """
     .. automethod:: random
     .. automethod:: __call__
@@ -224,7 +222,7 @@ class NArmedStarfish(WobblyCircle):
     def __init__(self, n_arms, amplitude):
         coeffs = np.zeros(n_arms)
         coeffs[-1] = amplitude
-        super(NArmedStarfish, self).__init__(coeffs)
+        super().__init__(coeffs)
 
 
 starfish = NArmedStarfish(5, 0.25)
@@ -310,17 +308,18 @@ def make_curve_mesh(curve_f, element_boundaries, order,
 
 # {{{ make_group_from_vertices
 
+@deprecate_keyword("group_factory", "group_cls")
 def make_group_from_vertices(vertices, vertex_indices, order,
-        group_factory=None):
-    # shape: (dim, nelements, nvertices)
+        group_cls=None, unit_nodes=None):
+    # shape: (ambient_dim, nelements, nvertices)
+    ambient_dim = vertices.shape[0]
     el_vertices = vertices[:, vertex_indices]
 
     from meshmode.mesh import SimplexElementGroup, TensorProductElementGroup
+    if group_cls is None:
+        group_cls = SimplexElementGroup
 
-    if group_factory is None:
-        group_factory = SimplexElementGroup
-
-    if issubclass(group_factory, SimplexElementGroup):
+    if issubclass(group_cls, SimplexElementGroup):
         if order < 1:
             raise ValueError("can't represent simplices with mesh order < 1")
 
@@ -333,10 +332,11 @@ def make_group_from_vertices(vertices, vertex_indices, order,
         dim = nspan_vectors
 
         # dim, nunit_nodes
-        if dim <= 3:
-            unit_nodes = mp.warp_and_blend_nodes(dim, order)
-        else:
-            unit_nodes = mp.equidistant_nodes(dim, order)
+        if unit_nodes is None:
+            if dim <= 3:
+                unit_nodes = mp.warp_and_blend_nodes(dim, order)
+            else:
+                unit_nodes = mp.equidistant_nodes(dim, order)
 
         unit_nodes_01 = 0.5 + 0.5*unit_nodes
 
@@ -344,24 +344,21 @@ def make_group_from_vertices(vertices, vertex_indices, order,
                 "si,des->dei",
                 unit_nodes_01, spanning_vectors) + el_origins
 
-    elif issubclass(group_factory, TensorProductElementGroup):
+    elif issubclass(group_cls, TensorProductElementGroup):
         nelements, nvertices = vertex_indices.shape
 
-        dim = 0
-        while True:
-            if nvertices == 2**dim:
-                break
-            if nvertices < 2**dim:
-                raise ValueError("invalid number of vertices for tensor-product "
-                        "elements, must be power of two")
-            dim += 1
+        dim = nvertices.bit_length() - 1
+        if nvertices != 2**dim:
+            raise ValueError("invalid number of vertices for tensor-product "
+                    "elements, must be power of two")
 
-        from modepy.quadrature.jacobi_gauss import legendre_gauss_lobatto_nodes
-        from modepy.nodes import tensor_product_nodes
-        unit_nodes = tensor_product_nodes(dim, legendre_gauss_lobatto_nodes(order))
+        if unit_nodes is None:
+            from modepy.quadrature.jacobi_gauss import legendre_gauss_lobatto_nodes
+            unit_nodes = mp.tensor_product_nodes(dim,
+                    legendre_gauss_lobatto_nodes(order))
+
         # shape: (dim, nnodes)
         unit_nodes_01 = 0.5 + 0.5*unit_nodes
-
         _, nnodes = unit_nodes.shape
 
         from pytools import generate_nonnegative_integer_tuples_below as gnitb
@@ -374,9 +371,9 @@ def make_group_from_vertices(vertices, vertex_indices, order,
                 vertex_ref = np.array(vertex_tuple, dtype=np.float64)
                 vdm[i, j] = np.prod(vertex_ref**func_tuple)
 
-        # shape: (dim, nelements, nvertices)
-        coeffs = np.empty((dim, nelements, nvertices))
-        for d in range(dim):
+        # shape: (ambient_dim, nelements, nvertices)
+        coeffs = np.empty((ambient_dim, nelements, nvertices))
+        for d in range(ambient_dim):
             coeffs[d] = la.solve(vdm, el_vertices[d].T).T
 
         vdm_nodes = np.zeros((nnodes, nvertices))
@@ -386,15 +383,13 @@ def make_group_from_vertices(vertices, vertex_indices, order,
                     axis=0)
 
         nodes = np.einsum("ij,dej->dei", vdm_nodes, coeffs)
-
     else:
-        raise ValueError("unsupported value for 'group_factory': %s"
-                % group_factory)
+        raise ValueError(f"unsupported value for 'group_cls': {group_cls}")
 
     # make contiguous
     nodes = nodes.copy()
 
-    return group_factory(
+    return group_cls(
             order, vertex_indices, nodes,
             unit_nodes=unit_nodes)
 
@@ -676,14 +671,16 @@ def generate_urchin(order, m, n, est_rel_interp_tolerance, min_rad=0.2):
 
 # {{{ generate_box_mesh
 
+@deprecate_keyword("group_factory", "group_cls")
 def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
-        group_factory=None, boundary_tag_to_face=None):
-    """Create a semi-structured mesh.
+        group_cls=None, boundary_tag_to_face=None,
+        mesh_type=None):
+    r"""Create a semi-structured mesh.
 
     :param axis_coords: a tuple with a number of entries corresponding
         to the number of dimensions, with each entry a numpy array
         specifying the coordinates to be used along that axis.
-    :param group_factory: One of :class:`meshmode.mesh.SimplexElementGroup`
+    :param group_cls: One of :class:`meshmode.mesh.SimplexElementGroup`
         or :class:`meshmode.mesh.TensorProductElementGroup`.
     :param boundary_tag_to_face: an optional dictionary for tagging boundaries.
         The keys correspond to custom boundary tags, with the values giving
@@ -693,6 +690,30 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
         For example::
 
             boundary_tag_to_face={"bdry_1": ["+x", "+y"], "bdry_2": ["-x"]}
+    :param mesh_type: In two dimensions with non-tensor-product elements,
+        *mesh_type* may be set to ``"X"`` to generate this type
+        of mesh::
+
+            _______
+            |\   /|
+            | \ / |
+            |  X  |
+            | / \ |
+            |/   \|
+            ^^^^^^^
+
+        instead of the default::
+
+            _______
+            |\    |
+            | \   |
+            |  \  |
+            |   \ |
+            |    \|
+            ^^^^^^^
+
+        Specifying a value other than *None* for all other mesh
+        dimensionalities and element types is an error.
 
     .. versionchanged:: 2017.1
 
@@ -701,6 +722,10 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
     .. versionchanged:: 2020.1
 
         *boundary_tag_to_face* parameter added.
+
+    .. versionchanged:: 2020.3
+
+        *group_factory* deprecated and renamed to *group_cls*.
     """
 
     if boundary_tag_to_face is None:
@@ -728,20 +753,22 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
     vertices = vertices.reshape(dim, -1)
 
     from meshmode.mesh import SimplexElementGroup, TensorProductElementGroup
-    if group_factory is None:
-        group_factory = SimplexElementGroup
+    if group_cls is None:
+        group_cls = SimplexElementGroup
 
-    if issubclass(group_factory, SimplexElementGroup):
+    if issubclass(group_cls, SimplexElementGroup):
         is_tp = False
-    elif issubclass(group_factory, TensorProductElementGroup):
+    elif issubclass(group_cls, TensorProductElementGroup):
         is_tp = True
     else:
-        raise ValueError("unsupported value for 'group_factory': %s"
-                % group_factory)
+        raise ValueError(f"unsupported value for 'group_cls': {group_cls}")
 
     el_vertices = []
 
     if dim == 1:
+        if mesh_type is not None:
+            raise ValueError("unsupported mesh_type")
+
         for i in range(shape[0]-1):
             # a--b
 
@@ -751,6 +778,31 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
             el_vertices.append((a, b,))
 
     elif dim == 2:
+        if mesh_type == "X" and not is_tp:
+            shape_m1 = tuple(si-1 for si in shape)
+
+            nmidpoints = product(shape_m1)
+            midpoint_indices = (
+                    nvertices
+                    + np.arange(nmidpoints).reshape(*shape_m1, order="F"))
+
+            midpoints = np.empty((dim,)+shape_m1, dtype=coord_dtype)
+            for idim in range(dim):
+                vshape = (shape_m1[idim],) + (1,)*idim
+                left_axis_coords = axis_coords[idim][:-1]
+                right_axis_coords = axis_coords[idim][1:]
+                midpoints[idim] = (
+                        0.5*(left_axis_coords+right_axis_coords)).reshape(*vshape)
+
+            midpoints = midpoints.reshape(dim, -1)
+            vertices = np.concatenate((vertices, midpoints), axis=1)
+
+        elif mesh_type is None:
+            pass
+
+        else:
+            raise ValueError("unsupported mesh_type")
+
         for i in range(shape[0]-1):
             for j in range(shape[1]-1):
 
@@ -765,11 +817,22 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
 
                 if is_tp:
                     el_vertices.append((a, b, c, d))
+
+                elif mesh_type == "X":
+                    m = midpoint_indices[i, j]
+                    el_vertices.append((a, b, m))
+                    el_vertices.append((b, d, m))
+                    el_vertices.append((d, c, m))
+                    el_vertices.append((c, a, m))
+
                 else:
                     el_vertices.append((a, b, c))
                     el_vertices.append((d, c, b))
 
     elif dim == 3:
+        if mesh_type is not None:
+            raise ValueError("unsupported mesh_type")
+
         for i in range(shape[0]-1):
             for j in range(shape[1]-1):
                 for k in range(shape[2]-1):
@@ -805,7 +868,7 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
 
     grp = make_group_from_vertices(
             vertices.reshape(dim, -1), el_vertices, order,
-            group_factory=group_factory)
+            group_cls=group_cls)
 
     # {{{ compute facial adjacency for mesh if there is tag information
 
@@ -846,7 +909,13 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
             for ielem in range(0, grp.nelements):
                 for ref_fvi in grp.face_vertex_indices():
                     fvi = grp.vertex_indices[ielem, ref_fvi]
-                    fvi_tuples = [vert_index_to_tuple[i] for i in fvi]
+                    try:
+                        fvi_tuples = [vert_index_to_tuple[i] for i in fvi]
+                    except KeyError:
+                        # Happens for interior faces of "X" meshes because
+                        # midpoints aren't in vert_index_to_tuple. We don't
+                        # care about them.
+                        continue
 
                     if all(fvi_tuple[axis] == vert_crit for fvi_tuple in fvi_tuples):
                         key = frozenset(fvi)
@@ -874,10 +943,13 @@ def generate_box_mesh(axis_coords, order=1, coord_dtype=np.float64,
 
 # {{{ generate_regular_rect_mesh
 
+@deprecate_keyword("group_factory", "group_cls")
 def generate_regular_rect_mesh(a=(0, 0), b=(1, 1), n=(5, 5), order=1,
                                boundary_tag_to_face=None,
-                               group_factory=None):
-    """Create a semi-structured rectangular mesh.
+                               group_cls=None,
+                               mesh_type=None,
+                               ):
+    """Create a semi-structured rectangular mesh with equispaced elements.
 
     :param a: the lower left hand point of the rectangle
     :param b: the upper right hand point of the rectangle
@@ -885,6 +957,7 @@ def generate_regular_rect_mesh(a=(0, 0), b=(1, 1), n=(5, 5), order=1,
       on [a,b].
     :param boundary_tag_to_face: an optional dictionary for tagging boundaries.
         See :func:`generate_box_mesh`.
+    :param mesh_type: See :func:`generate_box_mesh`.
     """
     if min(n) < 2:
         raise ValueError("need at least two points in each direction")
@@ -894,7 +967,8 @@ def generate_regular_rect_mesh(a=(0, 0), b=(1, 1), n=(5, 5), order=1,
 
     return generate_box_mesh(axis_coords, order=order,
                              boundary_tag_to_face=boundary_tag_to_face,
-                             group_factory=group_factory)
+                             group_cls=group_cls,
+                             mesh_type=mesh_type)
 
 # }}}
 

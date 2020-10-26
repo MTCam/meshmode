@@ -1,5 +1,3 @@
-from __future__ import division
-
 __copyright__ = "Copyright (C) 2020 Andreas Kloeckner"
 
 __license__ = """
@@ -266,11 +264,38 @@ class PyOpenCLArrayContext(ArrayContext):
         as the allocator can help avoid this cost.
     """
 
-    def __init__(self, queue, allocator=None):
+    def __init__(self, queue, allocator=None, wait_event_queue_length=None):
+        r"""
+        :arg wait_event_queue_length: The length of a queue of
+            :class:`~pyopencl.Event` objects that are maintained by the
+            array context, on a per-kernel-name basis. The events returned
+            from kernel execution are appended to the queue, and Once the
+            length of the queue exceeds *wait_event_queue_length*, the
+            first event in the queue :meth:`pyopencl.Event.wait`\ ed on.
+
+            *wait_event_queue_length* may be set to *False* to disable this feature.
+
+            The use of *wait_event_queue_length* helps avoid enqueuing
+            large amounts of work (and, potentially, allocating large amounts
+            of memory) far ahead of the actual OpenCL execution front,
+            by limiting the number of each type (name, really) of kernel
+            that may reside unexecuted in the queue at one time.
+
+        .. note::
+
+            For now, *wait_event_queue_length* should be regarded as an
+            experimental feature that may change or disappear at any minute.
+        """
         super().__init__()
         self.context = queue.context
         self.queue = queue
         self.allocator = allocator if allocator else None
+
+        if wait_event_queue_length is None:
+            wait_event_queue_length = 10
+
+        self._wait_event_queue_length = wait_event_queue_length
+        self._kernel_name_to_wait_event_queue = {}
 
         import pyopencl as cl
         if allocator is None and queue.device.type & cl.device_type.GPU:
@@ -317,6 +342,15 @@ class PyOpenCLArrayContext(ArrayContext):
                     "to create this program?")
 
         evt, result = program(self.queue, **kwargs, allocator=self.allocator)
+
+        if self._wait_event_queue_length is not False:
+            wait_event_queue = self._kernel_name_to_wait_event_queue.setdefault(
+                    program.name, [])
+
+            wait_event_queue.append(evt)
+            if len(wait_event_queue) > self._wait_event_queue_length:
+                wait_event_queue.pop(0).wait()
+
         return result
 
     def freeze(self, array):
@@ -354,6 +388,10 @@ class PyOpenCLArrayContext(ArrayContext):
             program = lp.split_iname(program, inner_iname, 16, inner_tag="l.0")
         return lp.tag_inames(program, {outer_iname: "g.0"})
 
+# }}}
+
+
+# {{{ pytest integration
 
 def pytest_generate_tests_for_pyopencl_array_context(metafunc):
     import pyopencl as cl
@@ -361,7 +399,7 @@ def pytest_generate_tests_for_pyopencl_array_context(metafunc):
 
     class ArrayContextFactory(_ContextFactory):
         def __call__(self):
-            ctx = super(ArrayContextFactory, self).__call__()
+            ctx = super().__call__()
             return PyOpenCLArrayContext(cl.CommandQueue(ctx))
 
         def __str__(self):
