@@ -22,10 +22,9 @@ THE SOFTWARE.
 
 import numpy as np
 
+from pytools import log_process
 import logging
 logger = logging.getLogger(__name__)
-
-from pytools import log_process
 
 
 # {{{ Build interpolation batches for group
@@ -69,8 +68,8 @@ def _build_interpolation_batches_for_group(
     """
     from meshmode.discretization.connection.direct import InterpolationBatch
 
-    num_children = len(record.tesselation.children) \
-                   if record.tesselation else 0
+    num_children = len(record.el_tess_info.children) \
+                   if record.el_tess_info else 0
     from_bins = [[] for i in range(1 + num_children)]
     to_bins = [[] for i in range(1 + num_children)]
     for elt_idx, refinement_result in enumerate(record.element_mapping):
@@ -87,9 +86,11 @@ def _build_interpolation_batches_for_group(
                 to_bin.append(child_idx)
 
     fine_unit_nodes = fine_discr_group.unit_nodes
+    fine_meg = fine_discr_group.mesh_el_group
+
     from meshmode.mesh.refinement.utils import map_unit_nodes_to_children
     mapped_unit_nodes = map_unit_nodes_to_children(
-        fine_unit_nodes, record.tesselation)
+            fine_meg, fine_unit_nodes, record.el_tess_info)
 
     from itertools import chain
     for from_bin, to_bin, unit_nodes in zip(
@@ -135,12 +136,11 @@ def make_refinement_connection(actx, refiner, coarse_discr, group_factory):
         raise ValueError(
             "coarse_discr does not live on the same mesh given to the refiner")
 
-    from meshmode.discretization import Discretization
-    fine_discr = Discretization(
-        actx,
-        fine_mesh,
-        group_factory,
-        real_dtype=coarse_discr.real_dtype)
+    fine_discr = coarse_discr.copy(
+        actx=actx,
+        mesh=fine_mesh,
+        group_factory=group_factory,
+        )
 
     groups = []
     for group_idx, (coarse_discr_group, fine_discr_group, record) in \

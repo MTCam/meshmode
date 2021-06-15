@@ -10,8 +10,11 @@ Contents:
    array
    discretization
    connection
+   distributed
    interop
    misc
+   🚀 Github <https://github.com/inducer/meshmode>
+   💾 Download Releases <https://pypi.org/project/meshmode>
 
 Indices and tables
 ==================

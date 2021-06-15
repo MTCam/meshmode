@@ -26,20 +26,23 @@ from functools import partial
 import numpy as np
 import pytest
 
-from meshmode.array_context import (  # noqa
+from arraycontext import thaw, _acf         # noqa: F401
+from arraycontext import (                  # noqa: F401
         pytest_generate_tests_for_pyopencl_array_context
         as pytest_generate_tests)
 
-from meshmode.dof_array import thaw, flat_norm
-from meshmode.mesh.generation import (  # noqa
-        generate_icosahedron, generate_box_mesh, make_curve_mesh, ellipse)
+from meshmode.dof_array import flat_norm
 from meshmode.mesh.refinement.utils import check_nodal_adj_against_geometry
 from meshmode.mesh.refinement import Refiner, RefinerWithoutAdjacency
+import meshmode.mesh.generation as mgen
 
+from meshmode.mesh import SimplexElementGroup, TensorProductElementGroup
 from meshmode.discretization.poly_element import (
     InterpolatoryQuadratureSimplexGroupFactory,
     PolynomialWarpAndBlendGroupFactory,
     PolynomialEquidistantSimplexGroupFactory,
+    LegendreGaussLobattoTensorProductGroupFactory,
+    GaussLegendreTensorProductGroupFactory,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,15 +99,15 @@ def uniform_refine_flags(mesh):
 
     ("3_to_1_ellipse_unif",
         partial(
-            make_curve_mesh,
-            partial(ellipse, 3),
+            mgen.make_curve_mesh,
+            partial(mgen.ellipse, 3),
             np.linspace(0, 1, 21),
             order=1),
         uniform_refine_flags,
         4),
 
     ("rect2d_rand",
-        partial(generate_box_mesh, (
+        partial(mgen.generate_box_mesh, (
             np.linspace(0, 1, 3),
             np.linspace(0, 1, 3),
             ), order=1),
@@ -112,7 +115,7 @@ def uniform_refine_flags(mesh):
         4),
 
     ("rect2d_unif",
-        partial(generate_box_mesh, (
+        partial(mgen.generate_box_mesh, (
             np.linspace(0, 1, 2),
             np.linspace(0, 1, 2),
             ), order=1),
@@ -125,7 +128,7 @@ def uniform_refine_flags(mesh):
         4),
 
     ("rect3d_rand",
-        partial(generate_box_mesh, (
+        partial(mgen.generate_box_mesh, (
             np.linspace(0, 1, 2),
             np.linspace(0, 1, 3),
             np.linspace(0, 1, 2),
@@ -134,7 +137,7 @@ def uniform_refine_flags(mesh):
         3),
 
     ("rect3d_unif",
-        partial(generate_box_mesh, (
+        partial(mgen.generate_box_mesh, (
             np.linspace(0, 1, 2),
             np.linspace(0, 1, 2)), order=1),
         uniform_refine_flags,
@@ -155,14 +158,17 @@ def test_refinement(case_name, mesh_gen, flag_gen, num_generations):
         check_nodal_adj_against_geometry(mesh)
 
 
-@pytest.mark.parametrize("refiner_cls", [
-    Refiner,
-    RefinerWithoutAdjacency
-    ])
-@pytest.mark.parametrize("group_factory", [
-    InterpolatoryQuadratureSimplexGroupFactory,
-    PolynomialWarpAndBlendGroupFactory,
-    PolynomialEquidistantSimplexGroupFactory
+@pytest.mark.parametrize(("refiner_cls", "group_factory"), [
+    (Refiner, InterpolatoryQuadratureSimplexGroupFactory),
+    (Refiner, PolynomialWarpAndBlendGroupFactory),
+    (Refiner, PolynomialEquidistantSimplexGroupFactory),
+
+    (RefinerWithoutAdjacency, InterpolatoryQuadratureSimplexGroupFactory),
+    (RefinerWithoutAdjacency, PolynomialWarpAndBlendGroupFactory),
+    (RefinerWithoutAdjacency, PolynomialEquidistantSimplexGroupFactory),
+
+    (RefinerWithoutAdjacency, LegendreGaussLobattoTensorProductGroupFactory),
+    (RefinerWithoutAdjacency, GaussLegendreTensorProductGroupFactory),
     ])
 @pytest.mark.parametrize(("mesh_name", "dim", "mesh_pars"), [
     ("circle", 1, [20, 30, 40]),
@@ -181,13 +187,18 @@ def test_refinement(case_name, mesh_gen, flag_gen, num_generations):
 def test_refinement_connection(
         actx_factory, refiner_cls, group_factory,
         mesh_name, dim, mesh_pars, mesh_order, refine_flags, visualize=False):
+    group_cls = group_factory.mesh_group_class
+    if issubclass(group_cls, TensorProductElementGroup):
+        if mesh_name in ["circle", "blob"]:
+            pytest.skip("mesh does not have tensor product support")
+
     from random import seed
     seed(13)
 
-    # Discretization order
-    order = 5
-
     actx = actx_factory()
+
+    # discretization order
+    order = 5
 
     from meshmode.discretization import Discretization
     from meshmode.discretization.connection import (
@@ -202,8 +213,9 @@ def test_refinement_connection(
         if mesh_name == "circle":
             assert dim == 1
             h = 1 / mesh_par
-            mesh = make_curve_mesh(
-                partial(ellipse, 1), np.linspace(0, 1, mesh_par + 1),
+            mesh = mgen.make_curve_mesh(
+                mgen.circle,
+                np.linspace(0, 1, mesh_par + 1),
                 order=mesh_order)
         elif mesh_name == "blob":
             if mesh_order == 5:
@@ -212,8 +224,11 @@ def test_refinement_connection(
             mesh = get_blob_mesh(mesh_par, mesh_order)
             h = float(mesh_par)
         elif mesh_name == "warp":
-            from meshmode.mesh.generation import generate_warped_rect_mesh
-            mesh = generate_warped_rect_mesh(dim, order=mesh_order, n=mesh_par)
+            # FIXME: Leftover from n -> nelements_per_axis/npoints_per_axis change;
+            # should be nelements_per_axis, but if changed EOC order dips below
+            # threshold and test fails. Likely just need to tweak mesh sizes.
+            mesh = mgen.generate_warped_rect_mesh(dim, order=mesh_order,
+                    npoints_side=mesh_par, group_cls=group_cls)
             h = 1/mesh_par
         else:
             raise ValueError("mesh_name not recognized")
@@ -248,18 +263,21 @@ def test_refinement_connection(
 
         fine_discr = connection.to_discr
 
-        x = thaw(actx, discr.nodes())
-        x_fine = thaw(actx, fine_discr.nodes())
+        x = thaw(discr.nodes(), actx)
+        x_fine = thaw(fine_discr.nodes(), actx)
         f_coarse = f(x)
         f_interp = connection(f_coarse)
         f_true = f(x_fine)
 
         if visualize == "dots":
             import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
+
             x = x.get(actx.queue)
             err = np.array(np.log10(
                 1e-16 + np.abs((f_interp - f_true).get(actx.queue))), dtype=float)
-            import matplotlib.cm as cm
+
+            # pylint: disable=no-member
             cmap = cm.ScalarMappable(cmap=cm.jet)
             cmap.set_array(err)
             plt.scatter(x[0], x[1], c=cmap.to_rgba(err), s=20, cmap=cmap)
@@ -289,12 +307,17 @@ def test_refinement_connection(
             or eoc_rec.max_error() < 1e-14)
 
 
-@pytest.mark.parametrize("with_adjacency", [True, False])
-def test_uniform_refinement(with_adjacency):
-    make_mesh = partial(generate_box_mesh, (
+@pytest.mark.parametrize(("group_cls", "with_adjacency"), [
+    (SimplexElementGroup, True),
+    (SimplexElementGroup, False),
+    (TensorProductElementGroup, False)
+    ])
+def test_uniform_refinement(group_cls, with_adjacency):
+    make_mesh = partial(mgen.generate_box_mesh, (
             np.linspace(0.0, 1.0, 2),
             np.linspace(0.0, 1.0, 3),
-            np.linspace(0.0, 1.0, 2)), order=4)
+            np.linspace(0.0, 1.0, 2)),
+            order=4, group_cls=group_cls)
     mesh = make_mesh()
 
     from meshmode.mesh.refinement import refine_uniformly
@@ -303,14 +326,42 @@ def test_uniform_refinement(with_adjacency):
 
 @pytest.mark.parametrize("refinement_rounds", [0, 1, 2])
 def test_conformity_of_uniform_mesh(refinement_rounds):
-    from meshmode.mesh.generation import generate_icosphere
-    mesh = generate_icosphere(r=1.0, order=4,
+    mesh = mgen.generate_icosphere(r=1.0, order=4,
             uniform_refinement_rounds=refinement_rounds)
 
     assert mesh.is_conforming
 
     from meshmode.mesh import is_boundary_tag_empty, BTAG_ALL
     assert is_boundary_tag_empty(mesh, BTAG_ALL)
+
+
+@pytest.mark.parametrize("mesh_name", ["torus", "icosphere", "cylinder"])
+def test_refine_surfaces(actx_factory, mesh_name, visualize=False):
+    if mesh_name == "torus":
+        mesh = mgen.generate_torus(10, 1, 40, 4, order=4)
+    elif mesh_name == "icosphere":
+        mesh = mgen.generate_icosphere(1, order=4)
+    elif mesh_name == "cylinder":
+        mesh = mgen.generate_surface_of_revolution(
+            lambda x, y: np.ones(x.shape),
+            np.linspace(1, 2),
+            np.linspace(0, 2*np.pi, 6, endpoint=False), order=4)
+    else:
+        raise ValueError(f"invalid mesh name '{mesh_name}'")
+
+    if visualize:
+        actx = actx_factory()
+        from meshmode.mesh.visualization import vtk_visualize_mesh
+        vtk_visualize_mesh(actx, mesh, "surface.vtu")
+
+    # check for absence of node-vertex consistency error
+    from meshmode.mesh.refinement import refine_uniformly
+    refined_mesh = refine_uniformly(mesh, 1)
+
+    if visualize:
+        actx = actx_factory()
+        from meshmode.mesh.visualization import vtk_visualize_mesh
+        vtk_visualize_mesh(actx, refined_mesh, "surface-refined.vtu")
 
 
 if __name__ == "__main__":

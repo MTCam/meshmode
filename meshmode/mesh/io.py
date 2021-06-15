@@ -52,9 +52,12 @@ class GmshMeshReceiver(GmshMeshReceiverBase):
         # meshpy.tet.MeshInfo
         self.points = None
         self.elements = None
+        self.element_vertices = None
+        self.element_nodes = None
         self.element_types = None
         self.element_markers = None
         self.tags = None
+        self.groups = None
         self.gmsh_tag_index_to_mine = None
 
         if mesh_construction_kwargs is None:
@@ -123,19 +126,16 @@ class GmshMeshReceiver(GmshMeshReceiverBase):
             raise RuntimeError("empty mesh in gmsh input")
 
         groups = self.groups = []
-
         ambient_dim = self.points.shape[-1]
 
-        mesh_bulk_dim = max(
-                el_type.dimensions for el_type in el_type_hist.keys())
+        mesh_bulk_dim = max(el_type.dimensions for el_type in el_type_hist)
 
         # {{{ build vertex numbering
 
         # map set of face vertex indices to list of tags associated to face
         face_vertex_indices_to_tags = {}
         vertex_gmsh_index_to_mine = {}
-        for element, (el_vertices, el_type) in enumerate(zip(
-                self.element_vertices, self.element_types)):
+        for element, el_vertices in enumerate(self.element_vertices):
             for gmsh_vertex_nr in el_vertices:
                 if gmsh_vertex_nr not in vertex_gmsh_index_to_mine:
                     vertex_gmsh_index_to_mine[gmsh_vertex_nr] = \
@@ -185,19 +185,29 @@ class GmshMeshReceiver(GmshMeshReceiverBase):
                     np.int32)
             i = 0
 
-            for element, (el_vertices, el_nodes, el_type) in enumerate(zip(
-                    self.element_vertices, self.element_nodes, self.element_types)):
+            for el_vertices, el_nodes, el_type in zip(
+                    self.element_vertices, self.element_nodes, self.element_types):
                 if el_type is not group_el_type:
                     continue
 
                 nodes[:, i] = self.points[el_nodes].T
-                vertex_indices[i] = [vertex_gmsh_index_to_mine[v_nr]
-                        for v_nr in el_vertices]
+                vertex_indices[i] = [
+                        vertex_gmsh_index_to_mine[v_nr] for v_nr in el_vertices
+                        ]
 
                 i += 1
 
-            unit_nodes = (np.array(group_el_type.lexicographic_node_tuples(),
-                    dtype=np.float64).T/group_el_type.order)*2 - 1
+            import modepy as mp
+            if isinstance(group_el_type, GmshSimplexElementBase):
+                shape = mp.Simplex(group_el_type.dimensions)
+            elif isinstance(group_el_type, GmshTensorProductElementBase):
+                shape = mp.Hypercube(group_el_type.dimensions)
+            else:
+                raise NotImplementedError(
+                        f"gmsh element type: {type(group_el_type).__name__}")
+
+            space = mp.space_for_shape(shape, group_el_type.order)
+            unit_nodes = mp.equispaced_nodes_for_space(space, shape)
 
             if isinstance(group_el_type, GmshSimplexElementBase):
                 group = SimplexElementGroup(
@@ -210,19 +220,11 @@ class GmshMeshReceiver(GmshMeshReceiverBase):
                 if group.dim == 2:
                     from meshmode.mesh.processing import flip_simplex_element_group
                     group = flip_simplex_element_group(vertices, group,
-                            np.ones(ngroup_elements, np.bool))
+                            np.ones(ngroup_elements, bool))
 
             elif isinstance(group_el_type, GmshTensorProductElementBase):
-                gmsh_vertex_tuples = type(group_el_type)(order=1).gmsh_node_tuples()
-                gmsh_vertex_tuples_loc_dict = {
-                        gvt: i
-                        for i, gvt in enumerate(gmsh_vertex_tuples)}
-
-                from pytools import (
-                        generate_nonnegative_integer_tuples_below as gnitb)
-                vertex_shuffle = np.array([
-                    gmsh_vertex_tuples_loc_dict[vt]
-                    for vt in gnitb(2, group_el_type.dimensions)])
+                vertex_shuffle = type(group_el_type)(
+                        order=1).get_lexicographic_gmsh_node_indices()
 
                 group = TensorProductElementGroup(
                     group_el_type.order,
@@ -231,8 +233,8 @@ class GmshMeshReceiver(GmshMeshReceiverBase):
                     unit_nodes=unit_nodes
                     )
             else:
-                raise NotImplementedError("gmsh element type: %s"
-                        % type(group_el_type).__name__)
+                # NOTE: already checked above
+                raise AssertionError()
 
             groups.append(group)
 
@@ -285,7 +287,7 @@ def read_gmsh(filename, force_ambient_dim=None, mesh_construction_kwargs=None):
     return recv.get_mesh()
 
 
-def generate_gmsh(source, dimensions=None, order=None, other_options=[],
+def generate_gmsh(source, dimensions=None, order=None, other_options=None,
         extension="geo", gmsh_executable="gmsh", force_ambient_dim=None,
         output_file_name="output.msh", mesh_construction_kwargs=None,
         target_unit=None):
@@ -301,6 +303,9 @@ def generate_gmsh(source, dimensions=None, order=None, other_options=[],
     :arg target_unit: Value of the option *Geometry.OCCTargetUnit*.
         Supported values are the strings `'M'` or `'MM'`.
     """
+    if other_options is None:
+        other_options = []
+
     recv = GmshMeshReceiver(mesh_construction_kwargs=mesh_construction_kwargs)
 
     from gmsh_interop.runner import GmshRunner

@@ -74,8 +74,7 @@ def _build_boundary_connection(actx, vol_discr, bdry_discr, connection_data,
             bdry_grp = bdry_discr.groups[ibdry_grp]
             data = connection_data[igrp, face_id]
 
-            bdry_unit_nodes_01 = (bdry_grp.unit_nodes + 1)*0.5
-            result_unit_nodes = (np.dot(data.A, bdry_unit_nodes_01).T + data.b).T
+            result_unit_nodes = data.face.map_to_volume(bdry_grp.unit_nodes)
 
             batches.append(
                 InterpolationBatch(
@@ -129,7 +128,7 @@ def _get_face_vertices(mesh, boundary_tag):
             nb_el_bits = -bdry_grp.neighbors
             face_relevant_flags = (nb_el_bits & btag_bit) != 0
 
-            for iface, fvi in enumerate(grp.face_vertex_indices()):
+            for fvi in grp.face_vertex_indices():
                 bdry_vertex_vol_nrs.update(
                         grp.vertex_indices
                         [bdry_grp.elements[face_relevant_flags]]
@@ -140,9 +139,9 @@ def _get_face_vertices(mesh, boundary_tag):
 
         # }}}
     else:
-        # For FRESTR_INTERIOR_FACES, this is likely every vertex in the book.
+        # For FACE_RESTR_INTERIOR, this is likely every vertex in the book.
         # Don't ever bother trying to cut the list down.
-        # For FRESTR_ALL_FACES, it literally is every single vertex.
+        # For FACE_RESTR_ALL, it literally is every single vertex.
 
         return np.arange(mesh.nvertices, dtype=np.intp)
 
@@ -208,7 +207,7 @@ def make_face_restriction(actx, discr, group_factory, boundary_tag,
 
     # }}}
 
-    from meshmode.mesh import Mesh, SimplexElementGroup
+    from meshmode.mesh import Mesh, _ModepyElementGroup
     bdry_mesh_groups = []
     connection_data = {}
 
@@ -220,9 +219,10 @@ def make_face_restriction(actx, discr, group_factory, boundary_tag,
 
         mgrp = grp.mesh_el_group
 
-        if not isinstance(mgrp, SimplexElementGroup):
+        if not isinstance(mgrp, _ModepyElementGroup):
             raise NotImplementedError("can only take boundary of "
-                    "SimplexElementGroup-based meshes")
+                    "meshes based on SimplexElementGroup and "
+                    "TensorProductElementGroup")
 
         # {{{ pull together per-group face lists
 
@@ -257,44 +257,42 @@ def make_face_restriction(actx, discr, group_factory, boundary_tag,
 
         # }}}
 
-        grp_face_vertex_indices = mgrp.face_vertex_indices()
-        grp_vertex_unit_coordinates = mgrp.vertex_unit_coordinates()
-
         batch_base = 0
 
-        # group by face_id
+        # group by face_index
 
-        for face_id in range(mgrp.nfaces):
-            batch_boundary_el_numbers_in_grp = np.array(
-                    [
-                        ibface_el
-                        for ibface_el, ibface_face in group_boundary_faces
-                        if ibface_face == face_id],
-                    dtype=np.intp)
+        for face in mgrp._modepy_faces:
+            batch_boundary_el_numbers_in_grp = np.array([
+                ibface_el
+                for ibface_el, ibface_face in group_boundary_faces
+                if ibface_face == face.face_index
+                ], dtype=np.intp)
 
             # {{{ preallocate arrays for mesh group
 
             nbatch_elements = len(batch_boundary_el_numbers_in_grp)
 
-            if per_face_groups or face_id == 0:
+            if per_face_groups or face.face_index == 0:
                 if per_face_groups:
                     ngroup_bdry_elements = nbatch_elements
                 else:
                     ngroup_bdry_elements = len(group_boundary_faces)
 
+                # make up some not-terrible nodes for the boundary Mesh
+                space = mp.space_for_shape(face, mgrp.order)
+                bdry_unit_nodes = mp.edge_clustered_nodes_for_space(space, face)
+
+                vol_basis = mp.basis_for_space(
+                        mgrp._modepy_space, mgrp._modepy_shape).functions
+
                 vertex_indices = np.empty(
-                        (ngroup_bdry_elements, mgrp.dim+1-1),
+                        (ngroup_bdry_elements, face.nvertices),
                         mgrp.vertex_indices.dtype)
 
-                bdry_unit_nodes = mp.warp_and_blend_nodes(mgrp.dim-1, mgrp.order)
-                bdry_unit_nodes_01 = (bdry_unit_nodes + 1)*0.5
-
-                vol_basis = mp.simplex_onb(mgrp.dim, mgrp.order)
-                nbdry_unit_nodes = bdry_unit_nodes_01.shape[-1]
+                nbdry_unit_nodes = bdry_unit_nodes.shape[-1]
                 nodes = np.empty(
                         (discr.ambient_dim, ngroup_bdry_elements, nbdry_unit_nodes),
                         dtype=np.float64)
-
             # }}}
 
             new_el_numbers = batch_base + np.arange(nbatch_elements)
@@ -303,24 +301,7 @@ def make_face_restriction(actx, discr, group_factory, boundary_tag,
 
             # {{{ no per-element axes in these computations
 
-            # Find boundary vertex indices
-            loc_face_vertices = list(grp_face_vertex_indices[face_id])
-
-            # Find unit nodes for boundary element
-            face_vertex_unit_coordinates = \
-                    grp_vertex_unit_coordinates[loc_face_vertices]
-
-            # Find A, b such that A [e_1 e_2] + b = [r_1 r_2]
-            # (Notation assumes that the volume is 3D and the face is 2D.
-            # Code does not.)
-
-            b = face_vertex_unit_coordinates[0]
-            A = (  # noqa
-                    face_vertex_unit_coordinates[1:]
-                    - face_vertex_unit_coordinates[0]).T
-
-            face_unit_nodes = (np.dot(A, bdry_unit_nodes_01).T + b).T
-
+            face_unit_nodes = face.map_to_volume(bdry_unit_nodes)
             resampling_mat = mp.resampling_matrix(
                     vol_basis,
                     face_unit_nodes, mgrp.unit_nodes)
@@ -331,7 +312,7 @@ def make_face_restriction(actx, discr, group_factory, boundary_tag,
 
             # Find vertex_indices
             glob_face_vertices = mgrp.vertex_indices[
-                    batch_boundary_el_numbers_in_grp][:, loc_face_vertices]
+                    batch_boundary_el_numbers_in_grp][:, face.volume_vertex_indices]
             vertex_indices[new_el_numbers] = \
                     vol_to_bdry_vertices[glob_face_vertices]
 
@@ -343,26 +324,26 @@ def make_face_restriction(actx, discr, group_factory, boundary_tag,
 
             # }}}
 
-            connection_data[igrp, face_id] = _ConnectionBatchData(
+            connection_data[igrp, face.face_index] = _ConnectionBatchData(
                     group_source_element_indices=batch_boundary_el_numbers_in_grp,
                     group_target_element_indices=new_el_numbers,
-                    A=A,
-                    b=b,
+                    face=face,
                     )
 
-            is_last_face = face_id + 1 == mgrp.nfaces
+            is_last_face = face.face_index + 1 == mgrp.nfaces
 
             if per_face_groups or is_last_face:
-                bdry_mesh_group = SimplexElementGroup(
+                bdry_mesh_group = type(mgrp)(
                         mgrp.order, vertex_indices, nodes,
                         unit_nodes=bdry_unit_nodes)
                 bdry_mesh_groups.append(bdry_mesh_group)
 
     bdry_mesh = Mesh(bdry_vertices, bdry_mesh_groups)
 
-    from meshmode.discretization import Discretization
-    bdry_discr = Discretization(
-            actx, bdry_mesh, group_factory)
+    bdry_discr = discr.copy(
+            actx=actx,
+            mesh=bdry_mesh,
+            group_factory=group_factory)
 
     connection = _build_boundary_connection(
             actx, discr, bdry_discr, connection_data,
@@ -426,7 +407,7 @@ def make_face_to_all_faces_embedding(actx, faces_connection, all_faces_discr,
     i_faces_grp = 0
 
     groups = []
-    for ivol_grp, vol_grp in enumerate(vol_discr.groups):
+    for vol_grp in vol_discr.groups:
         batches = []
 
         nfaces = vol_grp.mesh_el_group.nfaces
